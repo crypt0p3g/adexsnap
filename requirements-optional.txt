@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Kerberos authentication (--kerberos, --ccache, --ticket with a ccache).
+# Needs the OS Kerberos development/runtime packages installed first.
+gssapi==1.12.0
+
+# kirbi / KRB-CRED conversion only (--kirbi, --ticket with a kirbi file).
+impacket==0.13.1
