@@ -1,0 +1,16 @@
+# Local environments
+.venv/
+env/
+
+# Sensitive directory captures and ticket material
+*.dat
+*.ccache
+*.kirbi
+*.keytab
+
+# macOS
+.DS_Store
+
+# Python bytecode
+__pycache__/
+*.pyc

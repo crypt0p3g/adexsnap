@@ -31,9 +31,10 @@ team, and delete it when the retention period ends. The `.gitignore` excludes `.
 ## Requirements
 
 - Python 3.10 or newer
-- `ldap3`
+- `ldap3` 2.10.2rc4 or newer (NTLM TLS channel binding support)
 - `winacl`
-- `pycryptodome` for NTLM support on Python versions without built-in MD4
+- `pycryptodomex` for NTLM support
+- `cryptography` for NTLM TLS channel binding over LDAPS
 - a platform GSSAPI provider when using Kerberos (`gssapi` on most Linux/macOS systems)
 - `impacket` only when converting a kirbi/KRB-CRED file
 
@@ -89,6 +90,14 @@ Check the result:
 python3 adexsnap.py verify example.dat
 ```
 
+Create Certipy offline input and text/JSON reports from the finished snapshot:
+
+```bash
+python3 adexsnap.py certipy example.dat \
+  -o example-certipy.reg \
+  --run-certipy
+```
+
 `--dc` is the logical DC name. It is stored in the snapshot header and is also used for the
 Kerberos `ldap/<dc>` SPN. `--dc-ip` is only the address used for the network connection. Keep
 the FQDN in `--dc` when connecting to a fixed IP with Kerberos.
@@ -116,6 +125,11 @@ For LDAPS, use `--ssl` (port 636 by default). `--port` can override the LDAP por
 python3 adexsnap.py snapshot \
   --dc dc01.example.com --ssl -u auditor -d EXAMPLE -o example.dat
 ```
+
+When NTLM and `--ssl` are used together, adexsnap automatically supplies the TLS channel
+binding token required by domain controllers that enforce LDAP channel binding. This needs
+the `ldap3` and `cryptography` versions pinned in `requirements.txt`; the older stable
+`ldap3` 2.9.1 release does not expose the required connection option.
 
 The default settings are `--page-size 1000`, `--speed 100`, and `--timeout 30`. To add
 delays and request smaller pages, for example:
@@ -257,6 +271,54 @@ python3 adexsnap.py snapshot --dc dc01.example.com \
   -u auditor -d EXAMPLE -o example.dat --force
 ```
 
+## Certipy offline reports
+
+The `certipy` command reads AD CS certificate templates, enrollment services, publication
+state, domain identity, and raw security descriptors through adexsnap's built-in snapshot
+reader. It then writes the UTF-16 certificate-template cache `.reg` format accepted by
+Certipy 5.x's `parse -format reg` command. No DC connection is made during this step.
+
+Write the input and print the exact Certipy command without executing it:
+
+```bash
+python3 adexsnap.py certipy example.dat -o example-certipy.reg
+```
+
+Run Certipy immediately and create its default text and JSON reports:
+
+```bash
+python3 adexsnap.py certipy example.dat \
+  -o example-certipy.reg \
+  --run-certipy
+```
+
+The generated command uses a baseline low-privilege SID context: Everyone, Authenticated
+Users, Builtin Users, Domain Users, and Domain Computers. Supply `--owned-sids` with a
+principal and its nested groups to replace that context, or `--no-default-sids` to omit it.
+
+When a snapshot contains several enrollment CAs, the default uses the union of their
+published templates. Use `--ca NAME` for exact per-CA enabled status. Other options include
+`--vulnerable`, `--enabled`, `--hide-admins`, repeated `--report-format` values,
+`--metadata-output`, `--report-output`, and `--certipy-bin`.
+
+Existing reports are never overwritten automatically. A numeric suffix is added to the
+report prefix when needed. The `.reg` and metadata outputs require `--force` before an
+existing file is replaced.
+
+The exporter is also usable as a Python module:
+
+```python
+from adexsnap import SnapshotReader
+from certipy_export import export_snapshot
+
+metadata = export_snapshot(
+    "example.dat",
+    "example-certipy.reg",
+    reader_factory=SnapshotReader,
+)
+print(metadata.domain, metadata.template_count)
+```
+
 See [LICENSE](LICENSE) for licensing terms.
 
 ## Troubleshooting
@@ -269,6 +331,7 @@ See [LICENSE](LICENSE) for licensing terms.
 | `KRB5CCNAME file does not exist` | Use an absolute `FILE:/path/cache` or pass `--ccache`. |
 | kirbi conversion asks for Impacket | Install `impacket`, or provide a ccache instead. |
 | `--auth simple requires --ssl` | Add `--ssl`, or use NTLM/Kerberos. |
+| `80090346` / `SEC_E_BAD_BINDINGS` | Reinstall `requirements.txt`; NTLM over LDAPS needs the pinned `ldap3` version for channel binding. |
 | Bind timeout | Check DNS, routing, firewall rules, port, TLS, and `--timeout`. |
 | Naming contexts are missing | Confirm the endpoint is an AD DS RootDSE and the account can read it. |
 | The file retains `win-ad-XX` | The capture stopped before finalization; rerun from the beginning. |

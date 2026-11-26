@@ -7,6 +7,7 @@ import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 
@@ -15,8 +16,68 @@ SPEC = importlib.util.spec_from_file_location("adexsnap", os.path.join(HERE, "ad
 NG = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(NG)
 
+CERTIPY_SPEC = importlib.util.spec_from_file_location(
+    "certipy_export", os.path.join(HERE, "certipy_export.py"))
+CERTIPY_EXPORT = importlib.util.module_from_spec(CERTIPY_SPEC)
+sys.modules[CERTIPY_SPEC.name] = CERTIPY_EXPORT
+CERTIPY_SPEC.loader.exec_module(CERTIPY_EXPORT)
+
 
 class FormatTests(unittest.TestCase):
+    @staticmethod
+    def _ntlm_bind_args(ssl):
+        return types.SimpleNamespace(
+            kerberos=False,
+            username="mike",
+            password="test",
+            domain="DEFENDER",
+            dc="dc01.defender.example",
+            auth="ntlm",
+            workstation=None,
+            ssl=ssl,
+            timeout=60,
+        )
+
+    @staticmethod
+    def _fake_ldap3(channel_binding=True):
+        fake = types.SimpleNamespace(
+            SASL="SASL",
+            KERBEROS="KERBEROS",
+            SIMPLE="SIMPLE",
+            NTLM="NTLM",
+            Connection=mock.Mock(return_value="connection"),
+        )
+        if channel_binding:
+            fake.TLS_CHANNEL_BINDING = "TLS_CHANNEL_BINDING"
+        return fake
+
+    def test_ntlm_over_ldaps_enables_tls_channel_binding(self):
+        ldap3 = self._fake_ldap3()
+        result = NG._bind(ldap3, object(), self._ntlm_bind_args(ssl=True))
+        self.assertEqual(result, "connection")
+        ldap3.Connection.assert_called_once()
+        kwargs = ldap3.Connection.call_args.kwargs
+        self.assertEqual(kwargs["user"], "DEFENDER\\mike")
+        self.assertEqual(kwargs["authentication"], "NTLM")
+        self.assertEqual(kwargs["channel_binding"], "TLS_CHANNEL_BINDING")
+
+    def test_ntlm_without_ldaps_does_not_request_channel_binding(self):
+        ldap3 = self._fake_ldap3()
+        NG._bind(ldap3, object(), self._ntlm_bind_args(ssl=False))
+        self.assertNotIn("channel_binding", ldap3.Connection.call_args.kwargs)
+
+    def test_ntlm_over_ldaps_reports_incompatible_ldap3(self):
+        ldap3 = self._fake_ldap3(channel_binding=False)
+        with self.assertRaisesRegex(SystemExit, "ldap3 2.10.2rc4 or newer"):
+            NG._bind(ldap3, object(), self._ntlm_bind_args(ssl=True))
+
+    def test_certipy_is_an_adexsnap_subcommand(self):
+        args = NG.build_parser().parse_args(
+            ["certipy", "snapshot.dat", "-o", "certipy.reg"])
+        self.assertEqual(args.command, "certipy")
+        self.assertEqual(args.path, "snapshot.dat")
+        self.assertEqual(args.output, "certipy.reg")
+
     def test_default_ntlm_workstation_is_windows_shaped(self):
         captured = {}
 
@@ -195,6 +256,13 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(block[:8], struct.pack("<II", 1, 2))
         self.assertEqual(block[8:10], b"\x01\x02")
         self.assertTrue(block.endswith(NG._wstr("CN=One,DC=x")))
+
+    def test_dn_with_string_matches_native_count_only_layout(self):
+        # AD Explorer's type-28 writer stores numValues and returns without a
+        # payload.  Readers must not interpret the next attribute as a length table.
+        block = NG.SnapshotWriter._encode_values(
+            NG.ADSTYPE_DN_WITH_STRING, [b"one", b"two", b"three"])
+        self.assertEqual(block, struct.pack("<I", 3))
 
     def test_bare_dn_binary_uses_native_adsi_fallback(self):
         raw, dn = NG._split_dn_binary(b"CN=Discovery,DC=x")
@@ -439,6 +507,100 @@ class FormatTests(unittest.TestCase):
         reference = os.path.join(os.path.dirname(HERE), "a.dat")
         if os.path.exists(reference):
             self.assertEqual(NG.verify(reference), 0)
+
+    def test_snapshot_reader_is_reusable_by_offline_integrations(self):
+        fd, path = tempfile.mkstemp(suffix=".dat")
+        os.close(fd)
+        try:
+            descriptor = b"\x01\x00\x04\x80test-descriptor"
+            with NG.SnapshotWriter(path, server_name="dc.example.com",
+                                   build_treeview=False, build_classes=False) as writer:
+                writer.add_object({
+                    "distinguishedName": [b"CN=Template,DC=example,DC=com"],
+                    "objectClass": [b"top", b"pKICertificateTemplate"],
+                    "name": [b"Template"],
+                    "nTSecurityDescriptor": [descriptor],
+                })
+            with NG.SnapshotReader(path) as reader:
+                objects = list(reader.iter_objects(
+                    ["objectClass", "name", "nTSecurityDescriptor"]))
+                self.assertEqual(reader.server, "dc.example.com")
+            self.assertEqual(len(objects), 1)
+            self.assertEqual(objects[0]["name"], ["Template"])
+            self.assertEqual(objects[0]["nTSecurityDescriptor"], [descriptor])
+        finally:
+            os.unlink(path)
+
+    def test_certipy_export_uses_adexsnap_reader_end_to_end(self):
+        fd, snapshot = tempfile.mkstemp(suffix=".dat")
+        os.close(fd)
+        registry = snapshot + ".reg"
+        try:
+            domain_sid = (b"\x01\x04" + (5).to_bytes(6, "big")
+                          + struct.pack("<IIII", 21, 111, 222, 333))
+            descriptor = b"\x01\x00\x04\x80test-descriptor"
+            with NG.SnapshotWriter(snapshot, server_name="dc.example.com",
+                                   build_treeview=False, build_classes=False) as writer:
+                for name in (
+                    "mspki-enrollment-flag", "mspki-private-key-flag",
+                    "mspki-certificate-name-flag", "mspki-minimal-key-size",
+                    "mspki-ra-signature", "mspki-template-schema-version",
+                ):
+                    writer._collected_attr_syntax[name] = ("2.5.5.9", 2)
+                writer._collected_attr_syntax["pkiexpirationperiod"] = ("2.5.5.16", 65)
+                writer._collected_attr_syntax["pkioverlapperiod"] = ("2.5.5.16", 65)
+                writer.add_object({
+                    "distinguishedName": [b"DC=example,DC=com"],
+                    "objectClass": [b"top", b"domain", b"domainDNS"],
+                    "objectSid": [domain_sid],
+                })
+                writer.add_object({
+                    "distinguishedName": [
+                        b"CN=UserTemplate,CN=Certificate Templates,DC=example,DC=com"],
+                    "objectClass": [b"top", b"pKICertificateTemplate"],
+                    "name": [b"UserTemplate"],
+                    "displayName": [b"User Template"],
+                    "pKIExpirationPeriod": [b"-315360000000000"],
+                    "pKIOverlapPeriod": [b"-6048000000000"],
+                    "msPKI-Enrollment-Flag": [b"0"],
+                    "msPKI-Private-Key-Flag": [b"16"],
+                    "msPKI-Certificate-Name-Flag": [b"1"],
+                    "msPKI-Minimal-Key-Size": [b"2048"],
+                    "msPKI-RA-Signature": [b"0"],
+                    "msPKI-Template-Schema-Version": [b"2"],
+                    "pKIExtendedKeyUsage": [b"1.3.6.1.5.5.7.3.2"],
+                    "nTSecurityDescriptor": [descriptor],
+                })
+                writer.add_object({
+                    "distinguishedName": [
+                        b"CN=Example-CA,CN=Enrollment Services,DC=example,DC=com"],
+                    "objectClass": [b"top", b"pKIEnrollmentService"],
+                    "name": [b"Example-CA"],
+                    "certificateTemplates": [b"UserTemplate"],
+                })
+
+            metadata = CERTIPY_EXPORT.export_snapshot(
+                snapshot, registry, reader_factory=NG.SnapshotReader)
+            self.assertEqual(metadata.domain, "EXAMPLE.COM")
+            self.assertEqual(metadata.domain_sid, "S-1-5-21-111-222-333")
+            self.assertEqual(metadata.ca_name, "Example-CA")
+            self.assertEqual(metadata.published, ["UserTemplate"])
+            self.assertEqual(metadata.template_count, 1)
+            data = Path(registry).read_bytes()
+            self.assertTrue(data.startswith(b"\xff\xfe"))
+            text = data[2:].decode("utf-16-le")
+            self.assertIn("CertificateTemplateCache\\UserTemplate]", text)
+            self.assertIn('"Security"=hex:', text)
+            with self.assertRaisesRegex(ValueError, "output already exists"):
+                CERTIPY_EXPORT.export_snapshot(
+                    snapshot, registry, reader_factory=NG.SnapshotReader)
+            forced = CERTIPY_EXPORT.export_snapshot(
+                snapshot, registry, force=True, reader_factory=NG.SnapshotReader)
+            self.assertEqual(forced.template_count, 1)
+        finally:
+            for target in (snapshot, registry):
+                if os.path.exists(target):
+                    os.unlink(target)
 
 
 if __name__ == "__main__":

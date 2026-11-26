@@ -1,3 +1,4 @@
-ldap3==2.9.1
+ldap3==2.10.2rc4
 winacl==0.1.9
-pycryptodome==3.23.0
+pycryptodomex==3.24.2
+cryptography==50.0.2

@@ -1471,8 +1471,16 @@ def _bind(ldap3, server, args):
     user = args.username
     if "\\" not in user:
         user = "%s\\%s" % (domain, user)
+    ntlm_options = {}
+    if args.ssl:
+        try:
+            ntlm_options["channel_binding"] = ldap3.TLS_CHANNEL_BINDING
+        except AttributeError:
+            sys.exit("error: NTLM over LDAPS requires ldap3 2.10.2rc4 or newer for TLS "
+                     "channel binding; install the version pinned in requirements.txt")
+        _print("[+] NTLM TLS channel binding: enabled")
     return ldap3.Connection(server, user=user, password=args.password,
-                            authentication=ldap3.NTLM, **common)
+                            authentication=ldap3.NTLM, **ntlm_options, **common)
 
 
 def _looks_like_ip(host):
@@ -2038,6 +2046,133 @@ def _decode_value(r, pos, ads_type, name, syntax_id=None):
     return out
 
 
+class SnapshotReader:
+    """Read objects and raw attribute values from a completed AD Explorer snapshot.
+
+    This is the small reusable reader API for offline integrations.  It deliberately
+    returns each attribute as a list, matching LDAP's multi-value model and preserving
+    binary values such as SIDs and security descriptors as ``bytes``.
+    """
+
+    def __init__(self, path):
+        self.path = os.fspath(path)
+        self.fh = None
+        self._reader = None
+        self.signature = None
+        self.server = ""
+        self.num_objects = 0
+        self.num_attributes = 0
+        self.metadata_offset = 0
+        self.treeview_offset = 0
+        self.properties = []
+        self._property_by_name = {}
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+    def open(self):
+        if self.fh is not None:
+            return self
+        self.fh = open(self.path, "rb")
+        self._reader = _Reader(self.fh)
+        head = self.fh.read(HEADER_SIZE)
+        if len(head) < HEADER_SIZE:
+            self.close()
+            raise ValueError("file smaller than an AD Explorer snapshot header")
+        self.signature = head[0:10]
+        if self.signature != SIG_COMPLETE:
+            self.close()
+            raise ValueError("snapshot is incomplete or has an invalid signature")
+        marker = struct.unpack_from("<i", head, 10)[0]
+        if marker != MARKER:
+            self.close()
+            raise ValueError("snapshot has an invalid format marker")
+        self.num_objects = struct.unpack_from("<I", head, 1062)[0]
+        self.num_attributes = struct.unpack_from("<I", head, 1066)[0]
+        self.metadata_offset = struct.unpack_from("<Q", head, 1070)[0]
+        self.treeview_offset = struct.unpack_from("<Q", head, 1078)[0]
+        self.server = head[542:1062].decode("utf-16-le", "replace").rstrip("\x00")
+        self._read_properties()
+        return self
+
+    def close(self):
+        if self.fh is not None:
+            self.fh.close()
+        self.fh = None
+        self._reader = None
+
+    def _read_properties(self):
+        self.fh.seek(self.metadata_offset)
+        count = self._reader.u32()
+        properties = []
+        by_name = {}
+        for index in range(count):
+            length = self._reader.u32()
+            name = self.fh.read(length).decode("utf-16-le", "replace").rstrip("\x00")
+            syntax_id = self._reader.i32()
+            ads_type = self._reader.u32()
+            dn_length = self._reader.u32()
+            dn = self.fh.read(dn_length).decode("utf-16-le", "replace").rstrip("\x00")
+            self.fh.read(16 + 16 + 4)
+            properties.append((name, ads_type, dn, syntax_id))
+            by_name[name.casefold()] = index
+        self.properties = properties
+        self._property_by_name = by_name
+
+    def iter_objects(self, attributes=None):
+        """Yield snapshot objects as ``{attribute_name: [values...]}`` dictionaries."""
+        if self.fh is None:
+            raise RuntimeError("SnapshotReader must be opened before iterating")
+        selected = None
+        if attributes is not None:
+            selected = {
+                self._property_by_name[name.casefold()]
+                for name in attributes
+                if name.casefold() in self._property_by_name
+            }
+
+        self.fh.seek(HEADER_SIZE)
+        for object_number in range(self.num_objects):
+            object_start = self.fh.tell()
+            try:
+                object_size = self._reader.u32()
+                table_size = self._reader.u32()
+                if object_size < 8 + table_size * 8:
+                    raise ValueError("object %d has an invalid size" % object_number)
+                object_end = object_start + object_size
+                if object_end > self.metadata_offset:
+                    raise ValueError("object %d overlaps snapshot metadata" % object_number)
+                table = [(self._reader.u32(), self._reader.i32())
+                         for _ in range(table_size)]
+            except struct.error as exc:
+                raise ValueError("object %d has a truncated attribute table"
+                                 % object_number) from exc
+
+            result = {}
+            for property_index, relative_offset in table:
+                if selected is not None and property_index not in selected:
+                    continue
+                if property_index >= len(self.properties):
+                    raise ValueError("object %d references unknown property %d"
+                                     % (object_number, property_index))
+                name, ads_type, _dn, syntax_id = self.properties[property_index]
+                value_position = object_start + relative_offset
+                # AD Explorer reuses identical value blocks from earlier objects
+                # through negative relative offsets. Local values live inside this
+                # object; shared values may point anywhere back into the object region.
+                if not HEADER_SIZE <= value_position < object_end:
+                    raise ValueError("object %d attribute %s has an invalid value reference"
+                                     % (object_number, name))
+                result[name] = _decode_value(
+                    self._reader, value_position, ads_type, name, syntax_id)
+            yield result
+            self.fh.seek(object_end)
+
+
 def _pp(v):
     if isinstance(v, bytes):
         return v[:24].hex() + ("..." if len(v) > 24 else "")
@@ -2101,6 +2236,7 @@ def build_parser():
 Commands:
   adexsnap.py snapshot ...   collect a complete snapshot
   adexsnap.py verify FILE    validate a snapshot without a DC
+  adexsnap.py certipy FILE   export AD CS data for Certipy offline analysis
   adexsnap.py queries        print every supported full-snapshot filter
 
 Recommended NTLM capture (password prompt):
@@ -2210,7 +2346,8 @@ Output names receive a timestamp suffix unless --force is specified.""",
     perf.add_argument("--speed", type=_bounded_int("speed", 1, 100), default=100,
                       metavar="PERCENT", help="capture speed (1..100; 100 = no throttling)")
 
-    snap.add_argument("--ssl", action="store_true", help="use LDAPS (port 636)")
+    snap.add_argument("--ssl", action="store_true",
+                      help="use LDAPS (port 636); NTLM automatically uses TLS channel binding")
     snap.add_argument("--port", type=_bounded_int("port", 1, 65535),
                       help="override LDAP port (1..65535)")
     snap.add_argument("--description", default="", help="snapshot description string")
@@ -2232,6 +2369,10 @@ intended for diagnosis, not for exporting the directory.""",
     v.add_argument("--dump", type=int, default=0, metavar="N",
                    help="decode and print the first N objects' attributes")
     _add_color_options(v)
+
+    from certipy_export import add_subparser as add_certipy_subparser
+    certipy = add_certipy_subparser(sub)
+    _add_color_options(certipy)
 
     queries = sub.add_parser(
         "queries", help="list equivalent full-snapshot LDAP filters",
@@ -2316,6 +2457,9 @@ def main(argv=None):
                     pass
     if args.command == "verify":
         return verify(args.path, dump=args.dump)
+    if args.command == "certipy":
+        from certipy_export import run_from_args
+        return run_from_args(args, reader_factory=SnapshotReader)
     if args.command == "queries":
         return list_queries()
     build_parser().print_help()
